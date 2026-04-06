@@ -210,4 +210,5 @@ Scripts/
 output/
 src/scripts/
 src/setup
+installer.iss
 
