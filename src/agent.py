@@ -6,11 +6,11 @@ load_dotenv()
 
 app = Flask(__name__)
 
+app.register_blueprint(storage_acc_bp, url_prefix='/kernels')
+
 kernel_globals = {}
 
 #Hello World
-
-
 
 NODE_ID = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
 REGISTRY_URL = "https://computefabric.onrender.com/getConn/Capybara_34"
@@ -33,10 +33,6 @@ def _capture_matplotlib_figures():
     """Capture all open matplotlib figures as base64 PNG strings and close them."""
     images = []
     try:
-        import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
-
         for fig_num in plt.get_fignums():
             fig = plt.figure(fig_num)
             _style_fig_for_dark_bg(fig)
@@ -58,10 +54,6 @@ def _patch_plt_show(image_list):
     instead of trying to open a GUI window.
     """
     try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-
         original_show = plt.show
 
         def patched_show(*args, **kwargs):
@@ -162,6 +154,9 @@ def start_agent():
                             with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
                                 compiled_code = compile(code, "<string>", "exec")
                                 exec(compiled_code, kernel_globals)
+                            
+                            # Save kernel state after successful execution
+                            save_kernel_state(kernel_globals)
                         except Exception as e:
                             error_msg = traceback.format_exc()
                         
@@ -172,7 +167,6 @@ def start_agent():
                         # Restore original plt.show()
                         if original_show is not None:
                             try:
-                                import matplotlib.pyplot as plt
                                 plt.show = original_show
                             except ImportError:
                                 pass
