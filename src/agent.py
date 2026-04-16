@@ -1,4 +1,6 @@
 import secrets
+import ast
+import queue
 
 from imports import *
 
@@ -6,11 +8,13 @@ load_dotenv()
 
 app = Flask(__name__)
 
-app.register_blueprint(storage_acc_bp, url_prefix='/kernels')
-
+# In-memory state mimicking a Jupyter kernel
 kernel_globals = {}
 
-#Hello World
+def _disabled_input(prompt=""):
+    raise RuntimeError("Interactive input() is disabled in remote notebook execution to prevent thread blocking.")
+
+kernel_globals['input'] = _disabled_input
 
 NODE_ID = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
 REGISTRY_URL = "https://computefabric.onrender.com/getConn/Capybara_34"
@@ -80,8 +84,10 @@ class AgentState:
         self.server_url = None
         self.retry_count = 0
         self.last_heartbeat = None
+        self.active_ws = None
 
 state = AgentState()
+task_queue = queue.Queue()
 
 def connect_host():
     """Fetch server URL from registry."""
@@ -102,6 +108,118 @@ def connect_host():
         
     return server_url
 
+def process_queue_tasks():
+    global kernel_globals
+    while True:
+        data = task_queue.get()
+        if data is None:
+            continue
+        try:
+            ws = state.active_ws
+            if not ws or not state.is_connected:
+                print(f"Skipping task, ws closed: {data.get('type')}", flush=True)
+                continue
+            
+            print(f"Executing: {data.get('type')}", flush=True)
+
+            if data.get("type") == "task":
+                # Original logic: result = value * 2
+                payload = data.get("payload") or {}
+                value = payload.get("value", 0)
+                result = value * 2
+                
+                ws.send(json.dumps({
+                    "type": "result",
+                    "nodeId": NODE_ID,
+                    "taskId": data.get("taskId"),
+                    "result": result
+                }))
+                
+            elif data.get("type") == "specs":
+                from cust_func.get_specs import get_system_info
+                specs = get_system_info()
+                ws.send(json.dumps({
+                    "type": "specs_result",
+                    "nodeId": NODE_ID,
+                    "taskId": data.get("taskId"),
+                    "specs": specs
+                }))
+
+            elif data.get("type") == "execute":
+                stdout_capture = io.StringIO()
+                stderr_capture = io.StringIO()
+                error_msg = None
+                captured_images = []
+                
+                payload = data.get("payload") or {}
+                code = payload.get("code", "")
+
+                # Patch plt.show() before execution
+                original_show = _patch_plt_show(captured_images)
+
+                try:
+                    with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+                        tree = ast.parse(code)
+                        if tree.body:
+                            last_node = tree.body[-1]
+                            if isinstance(last_node, ast.Expr):
+                                if len(tree.body) > 1:
+                                    exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+                                    exec(compile(exec_tree, "<string>", "exec"), kernel_globals)
+                                eval_tree = ast.Expression(body=last_node.value)
+                                val = eval(compile(eval_tree, "<string>", "eval"), kernel_globals)
+                                if val is not None:
+                                    print(repr(val))
+                            else:
+                                compiled_code = compile(code, "<string>", "exec")
+                                exec(compiled_code, kernel_globals)
+                    
+                    # Check for imports and broadcast them
+                    import_statements = []
+                    for node in tree.body:
+                        if isinstance(node, (ast.Import, ast.ImportFrom)):
+                            import_statements.append(ast.unparse(node))
+                    
+                    if import_statements:
+                        ws.send(json.dumps({
+                            "type": "broadcast_imports",
+                            "nodeId": NODE_ID,
+                            "imports": "\n".join(import_statements)
+                        }))
+                except Exception as e:
+                    error_msg = traceback.format_exc()
+                
+                # Auto-capture any remaining open figures not captured by plt.show()
+                remaining = _capture_matplotlib_figures()
+                captured_images.extend(remaining)
+
+                # Restore original plt.show()
+                if original_show is not None:
+                    try:
+                        plt.show = original_show
+                    except ImportError:
+                        pass
+
+                ws.send(json.dumps({
+                    "type": "execute_result",
+                    "nodeId": NODE_ID,
+                    "taskId": data.get("taskId"),
+                    "output": stdout_capture.getvalue(),
+                    "error": stderr_capture.getvalue() or error_msg,
+                    "images": captured_images
+                }))
+
+            elif data.get("type") == "import_sync":
+                imports_code = data.get("payload", {}).get("imports", "")
+                if imports_code:
+                    try:
+                        exec(imports_code, kernel_globals)
+                        print(f"Synced imports:\n{imports_code}", flush=True)
+                    except Exception as e:
+                        print(f"Error syncing imports: {e}", flush=True)
+        except Exception as e:
+            print(f"Error processing task: {e}", flush=True)
+
 def start_agent():
     """Main background loop for the WebSocket agent."""
     global kernel_globals
@@ -116,83 +234,24 @@ def start_agent():
             def on_message(ws, message):
                 try:
                     data = json.loads(message)
-                    print(f"Received: {data.get('type')}")
-                    
-                    if data.get("type") == "task":
-                        # Original logic: result = value * 2
-                        payload = data.get("payload", {})
-                        value = payload.get("value", 0)
-                        result = value * 2
-                        
-                        ws.send(json.dumps({
-                            "type": "result",
-                            "nodeId": NODE_ID,
-                            "taskId": data.get("taskId"),
-                            "result": result
-                        }))
-                        
-                    elif data.get("type") == "specs":
-                        specs = get_system_info()
-                        ws.send(json.dumps({
-                            "type": "specs_result",
-                            "nodeId": NODE_ID,
-                            "taskId": data.get("taskId"),
-                            "specs": specs
-                        }))
-
-                    elif data.get("type") == "execute":
-                        stdout_capture = io.StringIO()
-                        stderr_capture = io.StringIO()
-                        error_msg = None
-                        captured_images = []
-                        code = data.get("payload").get("code")
-
-                        # Patch plt.show() before execution
-                        original_show = _patch_plt_show(captured_images)
-
-                        try:
-                            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-                                compiled_code = compile(code, "<string>", "exec")
-                                exec(compiled_code, kernel_globals)
-                            
-                            # Save kernel state after successful execution
-                            save_kernel_state(kernel_globals)
-                        except Exception as e:
-                            error_msg = traceback.format_exc()
-                        
-                        # Auto-capture any remaining open figures not captured by plt.show()
-                        remaining = _capture_matplotlib_figures()
-                        captured_images.extend(remaining)
-
-                        # Restore original plt.show()
-                        if original_show is not None:
-                            try:
-                                plt.show = original_show
-                            except ImportError:
-                                pass
-
-                        ws.send(json.dumps({
-                            "type": "execute_result",
-                            "nodeId": NODE_ID,
-                            "taskId": data.get("taskId"),
-                            "output": stdout_capture.getvalue(),
-                            "error": stderr_capture.getvalue() or error_msg,
-                            "images": captured_images
-                        }))
+                    print(f"Queued: {data.get('type')}", flush=True)
+                    task_queue.put(data)
                 except Exception as e:
-                    print(f"Error processing message: {e}")
+                    print(f"Error queueing message: {e}", flush=True)
 
             def on_error(ws, error):
-                print(f"WebSocket error: {error}")
+                print(f"WebSocket error: {error}", flush=True)
 
             def on_close(ws, close_status_code, close_msg):
                 state.is_connected = False
-                print("Disconnected from server.")
+                state.active_ws = None
+                print("Disconnected from server.", flush=True)
 
             def on_open(ws):
                 state.is_connected = True
+                state.active_ws = ws
                 state.retry_count = 0
-                print("Connected to server.")
+                print("Connected to server.", flush=True)
                 
                 # Register node
                 ws.send(json.dumps({
@@ -227,10 +286,10 @@ def start_agent():
             ws.run_forever()
             
         except Exception as e:
-            print(f"Agent error: {e}")
+            print(f"Agent error: {e}", flush=True)
             
         state.retry_count += 1
-        print("Reconnecting in 3 seconds...")
+        print("Reconnecting in 3 seconds...", flush=True)
         time.sleep(3)
 
 @app.route('/')
@@ -311,9 +370,15 @@ def get_specs():
     return jsonify(get_system_info())
 
 if __name__ == "__main__":
+    # Start the task processing queue loop in background thread
+    task_thread = threading.Thread(target=process_queue_tasks, daemon=True)
+    task_thread.start()
+
     # Start agent in background thread
     agent_thread = threading.Thread(target=start_agent, daemon=True)
     agent_thread.start()
+    
+
     
     # Run Flask server
     port = int(os.getenv("PORT", 5000))

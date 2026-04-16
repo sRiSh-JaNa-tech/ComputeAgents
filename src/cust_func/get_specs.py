@@ -4,6 +4,11 @@ import cpuinfo
 import subprocess
 import re
 import speedtest
+import time
+
+# Global cache for the speedtest so it doesn't block the websocket thread for 15+ seconds on every poll.
+_cached_speed = {'download': 'Pending...', 'upload': 'Pending...'}
+_last_speed_time = 0
 
 def get_system_info():
     """
@@ -73,22 +78,28 @@ def get_system_info():
             except Exception:
                 pass
 
-        # Speed test (can be slow, using a basic check or placeholder if needed)
-        # Using speedtest-cli (library)
-        speed_info = {'download': 'Calculating...', 'upload': 'Calculating...'}
-        try:
-            st = speedtest.Speedtest()
-            # For speed, we might want to skip the full test if it's too slow in real-time
-            # But the user asked for it. 
-            st.get_best_server()
-            download_speed = st.download() / 1_000_000  # Mbps
-            upload_speed = st.upload() / 1_000_000      # Mbps
-            speed_info = {
-                'download': f"{download_speed:.2f} Mbps",
-                'upload': f"{upload_speed:.2f} Mbps"
-            }
-        except Exception as e:
-            speed_info = {'error': str(e)}
+        # Speed test (can be slow, heavily cache it!)
+        global _cached_speed, _last_speed_time
+        current_time = time.time()
+        
+        # Only run speed test once every 3600 seconds (1 hour)
+        if current_time - _last_speed_time > 3600:
+            try:
+                # We can fire this and let it update the cache so the current request is fast, 
+                # but for simplicity we'll just block once an hour.
+                st = speedtest.Speedtest()
+                st.get_best_server()
+                download_speed = st.download() / 1_000_000  # Mbps
+                upload_speed = st.upload() / 1_000_000      # Mbps
+                _cached_speed = {
+                    'download': f"{download_speed:.2f} Mbps",
+                    'upload': f"{upload_speed:.2f} Mbps"
+                }
+                _last_speed_time = current_time
+            except Exception as e:
+                _cached_speed = {'error': str(e)}
+        
+        speed_info = _cached_speed
 
         return {
             'CPU': cpu_data,
