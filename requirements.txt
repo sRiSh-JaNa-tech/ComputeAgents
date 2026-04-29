@@ -12,3 +12,9 @@ scikit-learn
 matplotlib
 seaborn
 waitress
+seaborn
+tensorflow
+tensorflow-cpu
+xgboost
+optuna
+catboost

@@ -6,6 +6,14 @@ from imports import *
 
 load_dotenv()
 
+agent_log_fd = os.dup(1)
+def agent_log(*args, **kwargs):
+    msg = " ".join(map(str, args))
+    try:
+        os.write(agent_log_fd, (msg + '\n').encode('utf-8'))
+    except:
+        pass
+
 app = Flask(__name__)
 
 # In-memory state mimicking a Jupyter kernel
@@ -15,6 +23,118 @@ def _disabled_input(prompt=""):
     raise RuntimeError("Interactive input() is disabled in remote notebook execution to prevent thread blocking.")
 
 kernel_globals['input'] = _disabled_input
+
+class StreamingCapture:
+    def __init__(self, ws, node_id, task_id, target_fds=[1, 2]):
+        self.ws = ws
+        self.node_id = node_id
+        self.task_id = task_id
+        self.target_fds = target_fds
+        self.pipes = {}
+        self.original_fds = {}
+        self.threads = []
+        self.stop_event = threading.Event()
+        self.output_queue = queue.Queue()
+        
+    def _read_pipe(self, pipe_read, fd_name):
+        while not self.stop_event.is_set():
+            try:
+                data = os.read(pipe_read, 4096)
+                if not data:
+                    break
+                
+                text = data.decode('utf-8', errors='replace')
+                if text:
+                    self.output_queue.put({"text": text, "stream": fd_name})
+            except Exception:
+                break
+                
+    def _send_queue(self):
+        while not self.stop_event.is_set() or not self.output_queue.empty():
+            try:
+                item = self.output_queue.get(timeout=0.1)
+                text_buffer = [item["text"]]
+                stream_type = item["stream"]
+                
+                # Batch available queue items of the same stream type
+                while not self.output_queue.empty():
+                    next_item = self.output_queue.queue[0]
+                    if next_item["stream"] == stream_type:
+                        text_buffer.append(self.output_queue.get()["text"])
+                    else:
+                        break
+                        
+                combined_text = "".join(text_buffer)
+                
+                if self.ws:
+                    try:
+                        self.ws.send(json.dumps({
+                            "type": "execute_output",
+                            "nodeId": self.node_id,
+                            "taskId": self.task_id,
+                            "data": combined_text,
+                            "stream": stream_type
+                        }))
+                    except:
+                        pass
+                
+                time.sleep(0.05) # "slowly deque" as requested
+            except queue.Empty:
+                continue
+            except Exception:
+                break
+
+    def __enter__(self):
+        self.sender_thread = threading.Thread(target=self._send_queue, daemon=True)
+        self.sender_thread.start()
+        
+        for fd in self.target_fds:
+            fd_name = "stdout" if fd == 1 else "stderr"
+            try:
+                pipe_read, pipe_write = os.pipe()
+                self.pipes[fd] = (pipe_read, pipe_write)
+                self.original_fds[fd] = os.dup(fd)
+                os.dup2(pipe_write, fd)
+                os.close(pipe_write) # the FD 'fd' now holds the write end
+                
+                t = threading.Thread(target=self._read_pipe, args=(pipe_read, fd_name), daemon=True)
+                t.start()
+                self.threads.append(t)
+            except Exception as e:
+                agent_log(f"Error redirecting FD {fd}: {e}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Flush buffers
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            import ctypes
+            if os.name == 'nt':
+                msvcrt = ctypes.cdll.msvcrt
+                msvcrt.fflush(None)
+        except:
+            pass
+            
+        time.sleep(0.1) # Give reader threads a tiny bit to read flushed data
+        self.stop_event.set()
+        
+        for fd, original in self.original_fds.items():
+            try:
+                os.dup2(original, fd)
+                os.close(original)
+            except:
+                pass
+
+        for fd in self.target_fds:
+            if fd in self.pipes:
+                try:
+                    os.close(self.pipes[fd][0])
+                except:
+                    pass
+        
+        if hasattr(self, 'sender_thread'):
+            self.sender_thread.join(timeout=1.0)
 
 NODE_ID = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
 REGISTRY_URL = "https://computefabric.onrender.com/getConn/Capybara_34"
@@ -88,10 +208,11 @@ class AgentState:
 
 state = AgentState()
 task_queue = queue.Queue()
+TASK_THREAD_ID = None
 
 def connect_host():
     """Fetch server URL from registry."""
-    print(f"Fetching server info from {REGISTRY_URL}...")
+    agent_log(f"Fetching server info from {REGISTRY_URL}...")
     response = requests.get(REGISTRY_URL)
     response.raise_for_status()
     data = response.json()
@@ -109,7 +230,8 @@ def connect_host():
     return server_url
 
 def process_queue_tasks():
-    global kernel_globals
+    global kernel_globals, TASK_THREAD_ID
+    TASK_THREAD_ID = threading.get_ident()
     while True:
         data = task_queue.get()
         if data is None:
@@ -117,10 +239,10 @@ def process_queue_tasks():
         try:
             ws = state.active_ws
             if not ws or not state.is_connected:
-                print(f"Skipping task, ws closed: {data.get('type')}", flush=True)
+                agent_log(f"Skipping task, ws closed: {data.get('type')}")
                 continue
             
-            print(f"Executing: {data.get('type')}", flush=True)
+            agent_log(f"Executing: {data.get('type')}")
 
             if data.get("type") == "task":
                 # Original logic: result = value * 2
@@ -151,6 +273,7 @@ def process_queue_tasks():
                 error_msg = None
                 captured_images = []
                 
+                taskId = data.get("taskId")
                 payload = data.get("payload") or {}
                 code = payload.get("code", "")
 
@@ -158,7 +281,11 @@ def process_queue_tasks():
                 original_show = _patch_plt_show(captured_images)
 
                 try:
-                    with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+                    # Use both sys.stdout redirection and FD redirection
+                    with contextlib.redirect_stdout(stdout_capture), \
+                         contextlib.redirect_stderr(stderr_capture), \
+                         StreamingCapture(ws, NODE_ID, taskId):
+                        
                         tree = ast.parse(code)
                         if tree.body:
                             last_node = tree.body[-1]
@@ -186,6 +313,9 @@ def process_queue_tasks():
                             "nodeId": NODE_ID,
                             "imports": "\n".join(import_statements)
                         }))
+                except KeyboardInterrupt:
+                    error_msg = "Execution interrupted by user (KeyboardInterrupt)"
+                    agent_log("Execution interrupted.")
                 except Exception as e:
                     error_msg = traceback.format_exc()
                 
@@ -214,11 +344,11 @@ def process_queue_tasks():
                 if imports_code:
                     try:
                         exec(imports_code, kernel_globals)
-                        print(f"Synced imports:\n{imports_code}", flush=True)
+                        agent_log(f"Synced imports:\n{imports_code}")
                     except Exception as e:
-                        print(f"Error syncing imports: {e}", flush=True)
-        except Exception as e:
-            print(f"Error processing task: {e}", flush=True)
+                        agent_log(f"Error syncing imports: {e}")
+        except BaseException as e:
+            agent_log(f"Error processing task: {e}")
 
 def start_agent():
     """Main background loop for the WebSocket agent."""
@@ -229,29 +359,39 @@ def start_agent():
                 state.server_url = connect_host()
                 state.retry_count = 0
             
-            print(f"[Attempt {state.retry_count + 1}/10] Connecting to {state.server_url}...")
+            agent_log(f"[Attempt {state.retry_count + 1}/10] Connecting to {state.server_url}...")
             
             def on_message(ws, message):
                 try:
                     data = json.loads(message)
-                    print(f"Queued: {data.get('type')}", flush=True)
+                    if data.get('type') == 'interrupt':
+                        agent_log("Interrupt received!")
+                        import ctypes
+                        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(TASK_THREAD_ID), ctypes.py_object(KeyboardInterrupt))
+                        if res == 0:
+                            agent_log("Invalid thread id for interrupt")
+                        elif res != 1:
+                            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(TASK_THREAD_ID), 0)
+                            agent_log("Interrupt failed")
+                        return
+                    agent_log(f"Queued: {data.get('type')}")
                     task_queue.put(data)
                 except Exception as e:
-                    print(f"Error queueing message: {e}", flush=True)
+                    agent_log(f"Error queueing message: {e}")
 
             def on_error(ws, error):
-                print(f"WebSocket error: {error}", flush=True)
+                agent_log(f"WebSocket error: {error}")
 
             def on_close(ws, close_status_code, close_msg):
                 state.is_connected = False
                 state.active_ws = None
-                print("Disconnected from server.", flush=True)
+                agent_log("Disconnected from server.")
 
             def on_open(ws):
                 state.is_connected = True
                 state.active_ws = ws
                 state.retry_count = 0
-                print("Connected to server.", flush=True)
+                agent_log("Connected to server.")
                 
                 # Register node
                 ws.send(json.dumps({
